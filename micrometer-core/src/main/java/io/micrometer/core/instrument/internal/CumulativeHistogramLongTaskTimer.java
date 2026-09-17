@@ -19,21 +19,34 @@ import io.micrometer.core.instrument.Clock;
 import io.micrometer.core.instrument.distribution.CountAtBucket;
 import io.micrometer.core.instrument.distribution.DistributionStatisticConfig;
 import io.micrometer.core.instrument.distribution.HistogramSnapshot;
-import org.jspecify.annotations.Nullable;
 
-import java.util.Arrays;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Extends the default long task timer, making histogram counts cumulative over time.
+ * <p>
+ * The counts reported by the superclass only cover the tasks that are active when the
+ * snapshot is taken, so a bucket loses a task as soon as that task finishes or ages past
+ * the bucket. This timer carries the counts it published before forward and adds the
+ * tasks that entered each bucket since, which is what the Prometheus, OTLP and OpenTSDB
+ * registries need in order to report a histogram that does not decrease.
+ * <p>
+ * Only the histogram buckets are cumulative, and only approximately so. Tasks are counted
+ * from the change in the active counts between two snapshots, so a task that starts and
+ * finishes between two snapshots is never counted, and a bucket narrower than the
+ * interval between snapshots reports far fewer tasks than passed through it, possibly
+ * none at all. {@link HistogramSnapshot#count()}, {@link HistogramSnapshot#total()} and
+ * {@link HistogramSnapshot#max()} still describe the currently active tasks, so they do
+ * not agree with the buckets.
  *
  * @author Jon Schneider
  * @since 1.5.2
  */
 public class CumulativeHistogramLongTaskTimer extends DefaultLongTaskTimer {
 
-    private CountAtBucket @Nullable [] lastSnapshot;
+    private double[] lastActiveCounts = {};
+
+    private double[] cumulativeCounts = {};
 
     public CumulativeHistogramLongTaskTimer(Id id, Clock clock, TimeUnit baseTimeUnit,
             DistributionStatisticConfig distributionStatisticConfig) {
@@ -41,22 +54,30 @@ public class CumulativeHistogramLongTaskTimer extends DefaultLongTaskTimer {
     }
 
     @Override
-    public HistogramSnapshot takeSnapshot() {
+    public synchronized HistogramSnapshot takeSnapshot() {
         HistogramSnapshot snapshot = super.takeSnapshot();
+        CountAtBucket[] activeCounts = snapshot.histogramCounts();
+        if (lastActiveCounts.length != activeCounts.length) {
+            lastActiveCounts = new double[activeCounts.length];
+            cumulativeCounts = new double[activeCounts.length];
+        }
 
-        AtomicInteger i = new AtomicInteger();
+        CountAtBucket[] countAtBuckets = new CountAtBucket[activeCounts.length];
+        // How many tasks entered a bucket is taken to be the increase in its active
+        // count, which ignores the tasks that left the bucket over the same interval and
+        // so is a lower bound. A task that entered a bucket also entered every wider one,
+        // so each bucket takes the largest increase seen at or below it.
+        double entered = 0;
+        for (int i = 0; i < activeCounts.length; i++) {
+            double activeCount = activeCounts[i].count();
+            entered = Math.max(entered, activeCount - lastActiveCounts[i]);
+            lastActiveCounts[i] = activeCount;
+            cumulativeCounts[i] += entered;
+            countAtBuckets[i] = new CountAtBucket(activeCounts[i].bucket(), cumulativeCounts[i]);
+        }
 
-        snapshot = new HistogramSnapshot(snapshot.count(), snapshot.total(), snapshot.max(),
-                snapshot.percentileValues(),
-                Arrays.stream(snapshot.histogramCounts())
-                    .map(countAtBucket -> lastSnapshot == null ? countAtBucket
-                            : new CountAtBucket(countAtBucket.bucket(),
-                                    countAtBucket.count() + lastSnapshot[i.getAndIncrement()].count()))
-                    .toArray(CountAtBucket[]::new),
-                snapshot::outputSummary);
-
-        lastSnapshot = snapshot.histogramCounts();
-        return snapshot;
+        return new HistogramSnapshot(snapshot.count(), snapshot.total(), snapshot.max(), snapshot.percentileValues(),
+                countAtBuckets, snapshot::outputSummary);
     }
 
 }
